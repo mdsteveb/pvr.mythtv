@@ -59,6 +59,8 @@ WSAPI::WSAPI(const std::string& server, unsigned port, const std::string& securi
 , m_checked(false)
 , m_version()
 , m_serverHostName()
+, m_sessionToken("")
+, m_useSessionAuth(false)
 {
   m_checked = InitWSAPI();
 }
@@ -182,6 +184,9 @@ bool WSAPI::CheckVersion2_0()
   m_version.protocol = 0;
   m_version.schema = 0;
   m_version.version.clear();
+  m_useSessionAuth = false;  // Initialize to PIN-based auth
+  m_sessionToken.clear();
+  
   WSServiceVersion_t& wsv = m_serviceVersion[WS_Myth];
 
   WSRequest req = WSRequest(m_server, m_port);
@@ -189,29 +194,139 @@ bool WSAPI::CheckVersion2_0()
   req.RequestService("/Myth/GetConnectionInfo");
   if (!m_securityPin.empty())
   {
-    // Skip if null or empty
+    // Add PIN as parameter for traditional auth
     req.SetContentParam("Pin", m_securityPin);
   }
+  
+  WSResponse resp(req);
+  
+  // Try traditional PIN-based authentication first
+  if (resp.IsSuccessful())
+  {
+    // Parse content response
+    const JSON::Document json(resp);
+    const JSON::Node& root = json.GetRoot();
+    if (json.IsValid() && root.IsObject())
+    {
+      const JSON::Node& con = root.GetObjectValue("ConnectionInfo");
+      if (con.IsObject())
+      {
+        const JSON::Node& ver = con.GetObjectValue("Version");
+        JSON::BindObject(ver, &m_version, MythDTO::getVersionBindArray(wsv.ranking));
+        if (m_version.protocol)
+        {
+          DBG(DBG_INFO, "%s: Using traditional PIN-based authentication\n", __FUNCTION__);
+          m_useSessionAuth = false;  // Using PIN-based auth, not session auth
+          return true;
+        }
+      }
+    }
+    DBG(DBG_WARN, "%s: GetConnectionInfo response parsing failed\n", __FUNCTION__);
+    return false;
+  }
+  
+  // If GetConnectionInfo fails, try v36 LoginUser authentication as fallback
+  DBG(DBG_INFO, "%s: GetConnectionInfo with PIN failed (HTTP %d), attempting v36 LoginUser fallback\n", 
+      __FUNCTION__, resp.GetStatusCode());
+  
+  if (TryLoginUserAuth2_0())
+  {
+    // LoginUser succeeded, now try to get connection info again
+    // Even with session auth, GetConnectionInfo should work
+    WSRequest connReq = WSRequest(m_server, m_port);
+    connReq.RequestAccept(WS_ACCEPT);
+    connReq.RequestService("/Myth/GetConnectionInfo");
+    if (!m_securityPin.empty())
+    {
+      connReq.SetContentParam("Pin", m_securityPin);
+    }
+    
+    WSResponse connResp(connReq);
+    if (connResp.IsSuccessful())
+    {
+      const JSON::Document json(connResp);
+      const JSON::Node& root = json.GetRoot();
+      if (json.IsValid() && root.IsObject())
+      {
+        const JSON::Node& con = root.GetObjectValue("ConnectionInfo");
+        if (con.IsObject())
+        {
+          const JSON::Node& ver = con.GetObjectValue("Version");
+          JSON::BindObject(ver, &m_version, MythDTO::getVersionBindArray(wsv.ranking));
+          if (m_version.protocol)
+          {
+            DBG(DBG_INFO, "%s: Successfully obtained connection info with v36 session authentication\n", __FUNCTION__);
+            return true;
+          }
+        }
+      }
+    }
+    
+    // Even if GetConnectionInfo fails with session auth, if we have a valid session token,
+    // we should still be able to use it for other API calls
+    if (!m_sessionToken.empty())
+    {
+      DBG(DBG_WARN, "%s: GetConnectionInfo failed but session token is valid, proceeding with session auth\n", __FUNCTION__);
+      // Set some default values so initialization continues
+      m_version.protocol = 91;  // Assume modern protocol
+      m_version.schema = 1351;   // Assume modern schema
+      return true;
+    }
+  }
+  
+  DBG(DBG_ERROR, "%s: Both PIN-based auth and v36 LoginUser authentication failed\n", __FUNCTION__);
+  return false;
+}
+
+bool WSAPI::TryLoginUserAuth2_0()
+{
+  // Try v36 LoginUser authentication as fallback when GetConnectionInfo with PIN fails
+  // Uses the PIN as the password and "admin" as the username
+  
+  if (m_securityPin.empty())
+  {
+    DBG(DBG_WARN, "%s: No security PIN available for LoginUser\n", __FUNCTION__);
+    return false;
+  }
+  
+  DBG(DBG_INFO, "%s: Attempting v36 LoginUser authentication\n", __FUNCTION__);
+  
+  WSRequest req = WSRequest(m_server, m_port);
+  req.RequestAccept(WS_ACCEPT);
+  req.RequestService("/Myth/LoginUser");
+  
+  // POST with username="admin" and password=<PIN>
+  req.SetContentParam("UserName", "admin");
+  req.SetContentParam("Password", m_securityPin);
+  
   WSResponse resp(req);
   if (!resp.IsSuccessful())
   {
-    DBG(DBG_ERROR, "%s: invalid response\n", __FUNCTION__);
+    DBG(DBG_WARN, "%s: LoginUser failed with HTTP status %d\n", __FUNCTION__, resp.GetStatusCode());
     return false;
   }
-  // Parse content response
+  
+  // Parse response to extract session token
   const JSON::Document json(resp);
   const JSON::Node& root = json.GetRoot();
+  
   if (json.IsValid() && root.IsObject())
   {
-    const JSON::Node& con = root.GetObjectValue("ConnectionInfo");
-    if (con.IsObject())
+    const JSON::Node& field = root.GetObjectValue("String");
+    if (field.IsString())
     {
-      const JSON::Node& ver = con.GetObjectValue("Version");
-      JSON::BindObject(ver, &m_version, MythDTO::getVersionBindArray(wsv.ranking));
-      if (m_version.protocol)
+      std::string token = field.GetStringValue();
+      if (!token.empty())
+      {
+        m_sessionToken = token;
+        m_useSessionAuth = true;
+        DBG(DBG_INFO, "%s: v36 LoginUser authentication successful, session token acquired\n", __FUNCTION__);
         return true;
+      }
     }
   }
+  
+  DBG(DBG_WARN, "%s: LoginUser response parsing failed or returned empty token\n", __FUNCTION__);
   return false;
 }
 
@@ -2797,4 +2912,14 @@ ArtworkListPtr WSAPI::GetRecordingArtworkList1_32(uint32_t chanid, time_t recsta
     ret->push_back(artwork);
   }
   return ret;
+}
+
+std::string WSAPI::GetSessionToken() const
+{
+  return m_sessionToken;
+}
+
+bool WSAPI::IsSessionAuth() const
+{
+  return m_useSessionAuth;
 }

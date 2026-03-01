@@ -68,6 +68,18 @@ namespace Myth
     std::string ResolveHostName(const std::string& hostname);
 
     /**
+     * @brief Get session token for v36 authentication
+     * @return Session token if using session auth, empty string otherwise
+     */
+    std::string GetSessionToken() const;
+
+    /**
+     * @brief Check if using session-based authentication
+     * @return true if using session auth, false if using PIN-based auth
+     */
+    bool IsSessionAuth() const;
+
+    /**
      * @brief GET Myth/GetSetting
      */
     SettingPtr GetHostSetting(const std::string& key, const std::string& hostname)
@@ -516,6 +528,8 @@ namespace Myth
     bool m_checked;
     Version m_version;
     std::string m_serverHostName;
+    std::string m_sessionToken;
+    bool m_useSessionAuth;
     WSServiceVersion_t m_serviceVersion[WS_INVALID + 1];
     std::map<std::string, std::string> m_namedCache;
 
@@ -529,6 +543,7 @@ namespace Myth
     bool GetServiceVersion(WSServiceId_t id, WSServiceVersion_t& version);
     bool CheckServerHostName2_0();
     bool CheckVersion2_0();
+    bool TryLoginUserAuth2_0();
 
     SettingPtr GetSetting2_0(const std::string& key, const std::string& hostname);
     SettingPtr GetSetting5_0(const std::string& key, const std::string& hostname);
